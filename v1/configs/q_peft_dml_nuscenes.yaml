@@ -1,0 +1,174 @@
+# Q-PEFT-DML Configuration for nuScenes
+
+# ── Data ──────────────────────────────────────────────────────────────────────
+data:
+  data_root: "/data/nuscenes"
+  version: "v1.0-trainval"           # or "v1.0-mini" for quick experiments
+  batch_size: 4
+  num_workers: 4
+  point_cloud_range: [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0]
+  voxel_size: [0.2, 0.2, 8.0]
+  max_points_per_voxel: 10
+  max_voxels: 60000
+  img_size: [256, 704]               # H x W per camera
+  num_cameras: 6                     # nuScenes surround cameras
+
+# ── Model ─────────────────────────────────────────────────────────────────────
+model:
+  embed_dim: 256                     # shared latent space dimension
+
+  # Modality encoders (frozen backbone)
+  encoders:
+    lidar:
+      type: "sparse3d_cnn"           # VoxelNet-style backbone
+      in_channels: 4                 # x, y, z, intensity
+      out_channels: 256
+    camera:
+      type: "convnext"               # ConvNeXt image encoder
+      pretrained: "convnext_base"
+      out_channels: 256
+    radar:
+      type: "rd_map_encoder"         # Range-Doppler map encoder
+      in_channels: 2
+      out_channels: 128
+    imu:
+      type: "mlp"                    # Lightweight MLP state encoder
+      in_dim: 6                      # ax, ay, az, gx, gy, gz
+      out_channels: 64
+    gnss:
+      type: "mlp"
+      in_dim: 4                      # lat, lon, alt, speed
+      out_channels: 64
+
+  # LoRA configuration
+  lora:
+    enabled: true
+    # r per modality (larger for high-dim backbones)
+    ranks:
+      lidar: 8
+      camera: 8
+      radar: 4
+      imu: 4
+      gnss: 4
+    alpha: 16                        # LoRA scaling: alpha/r
+    dropout: 0.1
+
+  # Adapter layers
+  adapters:
+    enabled: true
+    bottleneck_dim: 64
+    dropout: 0.1
+
+  # Projection heads
+  projection:
+    hidden_dim: 512
+    out_dim: 256                     # must match embed_dim
+    normalize: true                  # L2-normalize embeddings
+
+  # Cross-attention fusion
+  fusion:
+    num_heads: 8
+    num_layers: 2
+    dropout: 0.1
+    drop_modality_prob: 0.3          # sensor dropout augmentation during training
+
+  # Detection head
+  detection:
+    num_classes: 10                  # nuScenes classes
+    bev_size: [128, 128]
+    anchor_sizes: [[4.63, 1.97, 1.74],   # car
+                   [0.73, 0.67, 1.77],   # pedestrian
+                   [6.93, 2.51, 2.84],   # truck
+                   [12.29, 2.90, 3.87],  # bus
+                   [0.50, 2.53, 0.98],   # motorcycle
+                   [1.70, 0.60, 1.28],   # bicycle
+                   [10.24, 2.84, 3.44],  # trailer
+                   [0.40, 0.41, 1.07],   # traffic cone
+                   [0.50, 2.53, 0.98],   # barrier
+                   [0.73, 0.67, 1.77]]   # construction vehicle
+
+# ── Quantization ──────────────────────────────────────────────────────────────
+quantization:
+  enabled: true
+  mode: "qat"                        # "qat" | "ptq" | "none"
+  # Which modules to quantize (only PEFT modules, backbone stays frozen+fp32)
+  target_modules: ["lora_A", "lora_B", "adapter_down", "adapter_up", "projection"]
+  bits:
+    lora: 8                          # INT8 for LoRA (high-dim)
+    adapter: 8
+    projection: 8
+    fusion: 8
+  # Quantizer settings
+  symmetric: true
+  per_channel: true                  # per-channel scale for better accuracy
+  observer: "minmax"                 # "minmax" | "percentile"
+  percentile: 99.9                   # used when observer=percentile
+  # Warm-up: start QAT after N steps of full-precision training
+  qat_warmup_steps: 1000
+
+# ── Loss Weights ──────────────────────────────────────────────────────────────
+loss:
+  lambda_det: 1.0
+  lambda_metric: 0.5                 # triplet loss
+  lambda_consistency: 0.1           # temporal + cross-modal
+  lambda_geometry: 0.3              # NEW: embedding geometry preservation
+  lambda_qat: 0.2                   # NEW: output distribution alignment
+
+  # Triplet loss margin
+  triplet_margin: 0.3
+  triplet_mining: "hard"            # "hard" | "semi-hard" | "all"
+
+  # Focal loss
+  focal_alpha: 0.25
+  focal_gamma: 2.0
+
+  # Geometry loss
+  geometry_temperature: 0.07        # softmax temperature for distance matrices
+  geometry_num_pairs: 512           # pairs sampled per batch
+
+# ── Training ──────────────────────────────────────────────────────────────────
+training:
+  epochs: 24
+  steps_per_epoch: null             # null = full dataset
+  optimizer:
+    type: "adamw"
+    lr: 1.0e-4
+    weight_decay: 0.01
+    betas: [0.9, 0.999]
+  scheduler:
+    type: "cosine"
+    warmup_epochs: 1
+    min_lr: 1.0e-6
+  grad_clip: 1.0
+  amp: true                         # mixed precision training
+  seed: 42
+
+# ── Evaluation ────────────────────────────────────────────────────────────────
+evaluation:
+  iou_threshold: 0.5
+  # Sensor dropout scenarios to evaluate
+  dropout_scenarios:
+    - name: "all_sensors"
+      missing: []
+    - name: "no_lidar"
+      missing: ["lidar"]
+    - name: "no_camera"
+      missing: ["camera"]
+    - name: "no_radar"
+      missing: ["radar"]
+    - name: "lidar_only"
+      missing: ["camera", "radar", "imu", "gnss"]
+    - name: "camera_only"
+      missing: ["lidar", "radar", "imu", "gnss"]
+  # Latency benchmarking
+  benchmark_iterations: 100
+  benchmark_warmup: 10
+
+# ── Logging & Checkpointing ───────────────────────────────────────────────────
+logging:
+  log_dir: "logs/"
+  checkpoint_dir: "checkpoints/"
+  save_every_n_epochs: 4
+  log_every_n_steps: 50
+  use_wandb: false
+  wandb_project: "q-peft-dml"
